@@ -1,0 +1,127 @@
+# setup-github.ps1
+# Fully automates: locate the zip, extract it, verify the folder, git init, create the repo
+# on GitHub via the API (with description), and push. Stops on any check failure instead of
+# running further commands in the wrong place.
+#
+# Usage:
+#   cd ~\Downloads      (or wherever github-ready-repo.zip is)
+#   powershell -ExecutionPolicy Bypass -File .\setup-github.ps1
+#
+# Token requirement: must be a CLASSIC Personal Access Token with the "repo" scope.
+# Fine-grained tokens cannot create new repositories via the API — only act on repos that
+# already exist. Create one at: github.com -> Settings -> Developer settings ->
+# Personal access tokens -> Tokens (classic) -> Generate new token -> check "repo".
+
+$ErrorActionPreference = "Stop"
+# NOTE: git writes normal status lines (e.g. push summaries) to stderr. With ErrorActionPreference
+# "Stop", PowerShell can turn those into a fake terminating error even on success. Every git call
+# below is wrapped to check $LASTEXITCODE explicitly rather than trusting PowerShell's own
+# success/failure signal, and temporarily drops to "Continue" around native git calls.
+$PrevEAP = $ErrorActionPreference
+
+$ProjectName    = "github-ready"
+$ExpectedFiles  = @("SKILL.md", "references", "README.md", "LICENSE", ".gitignore")
+$Description    = "Claude Skill: turns a finished project into a ready-to-upload, honest GitHub repo with zero fake claims and exact upload steps."
+
+function Fail($msg) {
+    Write-Host "FAILED: $msg" -ForegroundColor Red
+    exit 1
+}
+
+# 1. Find the zip — Downloads, Desktop, or wherever this script is being run from
+$SearchDirs = @("$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop", (Get-Location).Path)
+$ZipPath = $null
+foreach ($dir in $SearchDirs) {
+    $candidate = Join-Path $dir "$ProjectName-repo.zip"
+    if (Test-Path $candidate) { $ZipPath = $candidate; break }
+}
+if (-not $ZipPath) {
+    Fail "Could not find $ProjectName-repo.zip in Downloads, Desktop, or the current folder. Move it to one of those and re-run."
+}
+Write-Host "Found zip: $ZipPath" -ForegroundColor Green
+
+# 2. Extract
+$ExtractRoot = Split-Path $ZipPath -Parent
+Expand-Archive -Path $ZipPath -DestinationPath $ExtractRoot -Force
+$ProjectDir = Join-Path $ExtractRoot $ProjectName
+if (-not (Test-Path $ProjectDir)) {
+    Fail "Extraction didn't produce the expected folder: $ProjectDir"
+}
+Set-Location $ProjectDir
+Write-Host "In: $(Get-Location)" -ForegroundColor Green
+
+# 3. SAFETY GATE — verify this is really the project folder before touching git at all
+$ActualFiles = Get-ChildItem -Name
+$Unexpected  = $ActualFiles | Where-Object { $_ -notin $ExpectedFiles }
+if ($Unexpected) {
+    Fail "Unexpected items found here: $($Unexpected -join ', '). Refusing to run git init — this might not be the right folder."
+}
+foreach ($f in $ExpectedFiles) {
+    if ($f -notin $ActualFiles) { Fail "Missing expected file: $f" }
+}
+Write-Host "Folder verified — only expected project files present." -ForegroundColor Green
+
+# 4. Git init + commit (only now that the folder is verified)
+# git writes normal status lines to stderr; drop to "Continue" around native git calls so those
+# don't get misread as terminating errors, and check $LASTEXITCODE explicitly for real failures.
+$ErrorActionPreference = "Continue"
+if (-not (Test-Path ".git")) {
+    git init 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $PrevEAP; Fail "git init failed (exit $LASTEXITCODE)" }
+    git branch -M main 2>&1 | Out-Null
+}
+git add . 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $PrevEAP; Fail "git add failed (exit $LASTEXITCODE)" }
+$Status = git status --porcelain
+if ($Status) {
+    git commit -m "Initial commit: $ProjectName" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $PrevEAP; Fail "git commit failed (exit $LASTEXITCODE) — check git config user.email/user.name are set" }
+    Write-Host "Committed." -ForegroundColor Green
+} else {
+    Write-Host "Nothing new to commit." -ForegroundColor Yellow
+}
+$ErrorActionPreference = $PrevEAP
+
+# 5. Credentials
+$GhUser = Read-Host "GitHub username"
+$TokenSecure = Read-Host "GitHub Personal Access Token (hidden, needs 'repo' scope)" -AsSecureString
+$Bstr  = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($TokenSecure)
+$Token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($Bstr)
+[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr)
+
+$Headers = @{
+    Authorization = "Bearer $Token"
+    Accept        = "application/vnd.github+json"
+}
+
+# 6. Create the repo on GitHub via API (sets the description automatically)
+$Body = @{ name = $ProjectName; description = $Description; private = $false } | ConvertTo-Json
+try {
+    $Repo = Invoke-RestMethod -Uri "https://api.github.com/user/repos" -Method Post -Headers $Headers -Body $Body -ContentType "application/json"
+    Write-Host "Repo created: $($Repo.html_url)" -ForegroundColor Green
+} catch {
+    $ErrMsg = $_.ErrorDetails.Message
+    if ($ErrMsg -match "name already exists") {
+        Write-Host "Repo already exists on GitHub — pushing into it instead." -ForegroundColor Yellow
+    } else {
+        Fail "Repo creation failed: $ErrMsg"
+    }
+}
+
+# 7. Push, self-healing if the remote already has an unrelated initial commit
+$ErrorActionPreference = "Continue"
+$RemoteUrl = "https://github.com/$GhUser/$ProjectName.git"
+if (-not (git remote)) { git remote add origin $RemoteUrl } else { git remote set-url origin $RemoteUrl }
+
+git push -u origin main 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Direct push failed — retrying with unrelated-histories merge (common when the repo wasn't empty)." -ForegroundColor Yellow
+    git pull origin main --allow-unrelated-histories --no-edit 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $PrevEAP; Fail "Pull/merge failed — resolve conflicts manually, then: git push -u origin main" }
+    git push -u origin main 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $PrevEAP; Fail "Push still failing after merge. Check the token has 'repo' scope and the username is correct." }
+}
+$ErrorActionPreference = $PrevEAP
+
+Remove-Variable Token
+Write-Host "DONE. Repo live at: https://github.com/$GhUser/$ProjectName" -ForegroundColor Green
