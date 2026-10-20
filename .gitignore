@@ -1,0 +1,11 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Build artifacts (packaged skill — rebuild via zip, don't commit binaries)
+*.skill
+*.zip
+
+# Editor
+.vscode/
+.idea/
