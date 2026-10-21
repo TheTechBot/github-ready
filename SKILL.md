@@ -173,6 +173,14 @@ Never link a placeholder or stock photo. Only add badges that reflect something 
 
 If a project has both code and hardware files, license them separately and say so in the README.
 
+**Write the actual LICENSE file text for whichever one is chosen — never paste MIT text under a
+different name.** MIT, Apache-2.0, and GPL-3.0 are standard, publicly available license texts;
+generate the real text for the one picked (the current year and the user's name/handle go in the
+copyright line where the license format calls for it). For CERN-OHL-S/W, link to the official
+text (https://ohwr.org/project/cernohl) rather than paraphrasing it — hardware licenses have
+precise legal language that shouldn't be reconstructed from memory. For "no license," the LICENSE
+file is simply omitted and the README says plainly that all rights are reserved by the author.
+
 **Other files, add only once they apply:**
 - `.gitignore` — language/platform-appropriate
 - `docs/`, `media/`, dependency file, `BOM.csv` — once the project has real substance
@@ -208,22 +216,60 @@ sandbox has network access to `api.github.com`, create the repo and push every f
 the GitHub REST API, in this same turn — no download, no script, no terminal for the user to
 touch. The user's only input is a classic Personal Access Token with `repo` scope, pasted once in
 chat (fine-grained tokens can't create new repos). Use it only for that turn's API calls — never
-write it to a file, never store it, never echo it back.
+write it to a file, never store it, never echo it back. After the push, remind the user once that
+since the token was pasted directly in chat, it's good practice to revoke it from GitHub (Settings
+→ Developer settings → Personal access tokens) and generate a fresh one for next time — every run
+that uses a pasted token, not just the first.
+
+**Large files (over roughly 1MB):** the Contents API used below can't handle these well. Detect
+any such file before pushing and handle it properly instead of letting the push fail confusingly:
+use the Git Data API (blobs/trees handle larger content than Contents API PUTs) for anything up
+to GitHub's normal repo limits, and for anything that's genuinely large binary/media content that
+will keep changing (datasets, video), set up Git LFS instead — add a `.gitattributes` rule
+tracking that file pattern and note in the handoff that LFS is in use, since that affects how
+others clone the repo.
+
+**Always ask public or private before creating the repo — never default to public silently.**
+A portfolio piece is usually meant to be public, but an in-progress or personal project often
+isn't; this is the user's call every time, not an assumption.
 
 ```bash
-# Create the repo (sets description in the same call)
+# Create the repo (sets description in the same call) — "private" reflects what was actually asked
 curl -s -X POST https://api.github.com/user/repos \
   -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-  -d '{"name":"<repo>","description":"<real one-line description>","private":false}'
+  -d '{"name":"<repo>","description":"<real one-line description>","private":<true|false>}'
 
 # Push each file via the Contents API (simplest for a first commit)
 # — base64-encode each file, PUT to /repos/<owner>/<repo>/contents/<path-in-repo>
 # — if a file already exists, GET it first for its sha and include that sha in the PUT
+# — GitHub's Contents API caps each file around 1MB; anything bigger needs the Git Data API
+#   (blobs/trees) or Git LFS — see "Large files" below
 ```
 For many files, prefer the Git Data API (blobs → tree → commit → update ref) over repeated
 Contents API calls — one atomic commit instead of N. Either way: after pushing, `GET
 .../contents/` once to confirm the files actually landed before reporting success — never trust
 HTTP status codes alone.
+
+**Repeat runs (the repo already exists from a previous push):** don't blind-overwrite everything.
+For each local file, compare its content against the existing file at that path (fetch it and
+diff, or compare a hash) and only PUT the ones that actually changed or are new — report which
+files were skipped as unchanged. This avoids noisy commit history and needless API calls.
+
+**If the push is interrupted partway** (rate limit, network drop): keep a running list of which
+files succeeded as you go. On retry, skip the ones already confirmed pushed and resume from where
+it stopped — don't restart the whole repo from zero.
+
+**Topics:** if the repo already has topics set, `GET .../topics` first and merge the new ones in
+rather than overwriting the existing set.
+
+**Before pushing anything, show a quick preview** — the file tree and the README's first few
+lines — and get a go-ahead, especially the first time this runs in a conversation. A repo going
+live is not reversible in the casual sense (other people can fork/star it the moment it's public),
+so a person should see what's about to happen before it happens.
+
+**Health check pass before pushing:** flag anything that looks like an accidental huge binary,
+build artifact, or dependency folder (`node_modules/`, `.venv/`, compiled binaries) that isn't
+already excluded by `.gitignore` — these bloat repos and are rarely meant to be committed.
 
 **2. Real GitHub MCP connector**, only if one is found (`search_mcp_registry` with "github") and
 the user hasn't already hit a permission wall with it this conversation. In practice, standard
@@ -302,6 +348,35 @@ Password prompt → use a Personal Access Token, not the account password.
 Whichever upload path ran, zip the folder and offer it to the user regardless (so they have a
 local copy even after an automated push), then end with a short, honest status: what's in the
 repo, the live URL, and what's still missing (tests never run, license not chosen, etc.).
+
+## Other hosts (GitLab, Bitbucket)
+
+Despite the skill's name, the same workflow applies if the user wants GitLab or Bitbucket instead
+of GitHub — ask which host before assuming GitHub if it's not obvious from context. The create +
+push pattern is the same shape, different API:
+- **GitLab:** `POST /api/v4/projects` to create (token header `PRIVATE-TOKEN`), then the Commits
+  API or Git Data equivalent to push files.
+- **Bitbucket:** `POST /2.0/repositories/{workspace}/{repo_slug}` to create, then its source/commit
+  API to push files.
+Same rules apply regardless of host: ask public/private, never fabricate, scan for secrets,
+preview before pushing, confirm after.
+
+## Optional CI workflow
+
+Only offer this — never add it unasked. If the project has something genuinely checkable (tests
+that exist and pass, a lint config, a build step that was actually run in this conversation), ask
+if a one-file `.github/workflows/ci.yml` running that check on push would be wanted. If yes,
+generate the minimal workflow for exactly that check — nothing padded in "for completeness." If
+there's nothing real to check, don't bring this up; an empty or fake CI badge is exactly the kind
+of decoration the hard rules forbid.
+
+## Before skipping the media section
+
+Don't just drop the "Demo"/screenshots section silently because no images were shared in this
+conversation — ask once: "Got any screenshots or a demo clip you want in the README?" If the
+user has them but didn't think to share them, this is an easy win for the repo that's otherwise
+lost. If they say no or don't have any, proceed without the section as normal — one ask, not a
+repeated nag.
 
 ## Output tone
 
